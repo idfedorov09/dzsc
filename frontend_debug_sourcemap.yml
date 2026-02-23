@@ -1,0 +1,14 @@
+# Default settings for Makefile_frontend_debug.
+# All paths are relative to the project root where build.gradle/gradlew live.
+
+# Concat source directories that can be expanded into original files.
+concat_source_roots:
+  - src/main/js
+  - src/js
+
+# Extra roots (relative to project root) to search for local modules when a bundle
+# comes from expandedArchives/* and is not visible in rootProject.allprojects
+# (for example includeBuild 'org.zenframework.z8').
+local_project_search_roots:
+  - .
+  - org.zenframework.z8
