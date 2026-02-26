@@ -1,0 +1,533 @@
+import groovy.json.JsonOutput
+
+final String SM_ENCODING = 'UTF-8'
+final String SM_BASE64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+
+class Z8SmSegment {
+	File file
+	String sourcePath
+	String content
+	boolean separatorOnly = false
+}
+
+ext.z8DebugSourcemap = [:]
+
+ext.z8DebugSourcemap.normalizeSlashes = { String value ->
+	value == null ? null : value.replace('\\', '/')
+}
+
+ext.z8DebugSourcemap.trimSlashes = { String value ->
+	if(value == null)
+		return null
+	String out = ext.z8DebugSourcemap.normalizeSlashes(value).trim()
+	while(out.startsWith('/'))
+		out = out.substring(1)
+	while(out.endsWith('/'))
+		out = out.substring(0, out.length() - 1)
+	out
+}
+
+ext.z8DebugSourcemap.envList = { String envName, List<String> defaults ->
+	String raw = System.getenv(envName)
+	List<String> values = []
+	if(raw != null && !raw.trim().isEmpty()) {
+		raw.split(/[,\n;]/).each { String item ->
+			String v = ext.z8DebugSourcemap.trimSlashes(item)
+			if(v != null && !v.isEmpty())
+				values << v
+		}
+	}
+	if(values.isEmpty() && defaults != null) {
+		defaults.each { String item ->
+			String v = ext.z8DebugSourcemap.trimSlashes(item)
+			if(v != null && !v.isEmpty())
+				values << v
+		}
+	}
+	values
+}
+
+ext.z8DebugSourcemap.concatSourceRoots = ext.z8DebugSourcemap.envList('Z8_SM_CONCAT_SOURCE_ROOTS', ['src/main/js', 'src/js'])
+ext.z8DebugSourcemap.localProjectSearchRoots = ext.z8DebugSourcemap.envList('Z8_SM_LOCAL_PROJECT_SEARCH_ROOTS', ['.', 'org.zenframework.z8'])
+
+ext.z8DebugSourcemap.findDebugEntryScript = {
+	File debugHtml = new File(project.buildDir, 'web/debug.html')
+	if(debugHtml.exists()) {
+		String html = debugHtml.getText(SM_ENCODING)
+		def matcher = (html =~ /src=\"debug\/([^\"?#]+\.js)\"/)
+		if(matcher.find())
+			return new File(project.buildDir, "web/debug/${matcher.group(1)}")
+	}
+
+	File fallback = new File(project.buildDir, "web/debug/${project.name}.js")
+	return fallback
+}
+
+ext.z8DebugSourcemap.vlqSigned = { int value ->
+	value < 0 ? (((-value) << 1) + 1) : (value << 1)
+}
+
+ext.z8DebugSourcemap.encodeVlq = { int value ->
+	int vlq = ext.z8DebugSourcemap.vlqSigned(value)
+	StringBuilder out = new StringBuilder()
+	boolean firstDigit = true
+	while(firstDigit || vlq > 0) {
+		firstDigit = false
+		int digit = (vlq & 31)
+		vlq = vlq >>> 5
+		if(vlq > 0)
+			digit |= 32
+		out.append(SM_BASE64.charAt(digit))
+	}
+	out.toString()
+}
+
+ext.z8DebugSourcemap.fileSuffixKey = { File file ->
+	String p = ext.z8DebugSourcemap.normalizeSlashes(file.absolutePath)
+	int webIdx = p.lastIndexOf('/web/')
+	if(webIdx >= 0)
+		return p.substring(webIdx + 1)
+	return file.name
+}
+
+ext.z8DebugSourcemap.relativeSourcePath = { File file ->
+	try {
+		return ext.z8DebugSourcemap.normalizeSlashes(project.rootProject.rootDir.toPath().relativize(file.toPath()).toString())
+	} catch(Exception ignored) {
+		return ext.z8DebugSourcemap.normalizeSlashes(file.absolutePath)
+	}
+}
+
+ext.z8DebugSourcemap.readBuildorderFiles = { File sourceDir, Object buildorderName ->
+	if(sourceDir == null || !sourceDir.exists())
+		return []
+
+	File orderFile = new File(sourceDir, String.valueOf(buildorderName ?: '.buildorder'))
+	if(!orderFile.exists())
+		return []
+
+	List<File> files = []
+	orderFile.readLines(SM_ENCODING).each { String line ->
+		String path = line.trim()
+		if(path.isEmpty() || path.startsWith('#'))
+			return
+		File src = new File(sourceDir, path)
+		if(!src.exists())
+			throw new GradleException("Buildorder entry not found: ${src}")
+		files << src
+	}
+	files
+}
+
+ext.z8DebugSourcemap.sourceDirAllowed = { File sourceDir ->
+	if(sourceDir == null)
+		return false
+	String normalized = ext.z8DebugSourcemap.normalizeSlashes(sourceDir.absolutePath)
+	(ext.z8DebugSourcemap.concatSourceRoots as List<String>).any { String relRoot ->
+		String trimmed = ext.z8DebugSourcemap.trimSlashes(relRoot)
+		trimmed != null && !trimmed.isEmpty() && (normalized.endsWith('/' + trimmed) || normalized == trimmed)
+	}
+}
+
+ext.z8DebugSourcemap.hasWildcard = { String pattern ->
+	pattern != null && (pattern.contains('*') || pattern.contains('?') || pattern.contains('['))
+}
+
+ext.z8DebugSourcemap.antPatternToRegex = { String pattern ->
+	StringBuilder rx = new StringBuilder('^')
+	char[] chars = pattern.toCharArray()
+	int i = 0
+	while(i < chars.length) {
+		char ch = chars[i]
+		if(ch == '*') {
+			boolean doubleStar = (i + 1 < chars.length && chars[i + 1] == '*')
+			if(doubleStar) {
+				rx.append('.*')
+				i++
+			} else {
+				rx.append('[^/]*')
+			}
+		} else if(ch == '?') {
+			rx.append('[^/]')
+		} else if('.\\+()^${}|'.indexOf(ch) >= 0) {
+			rx.append('\\').append(ch)
+		} else {
+			rx.append(ch)
+		}
+		i++
+	}
+	rx.append('$').toString()
+}
+
+ext.z8DebugSourcemap.resolveRequireFiles = { def concatTask ->
+	def requires = []
+	try {
+		boolean canExtract = concatTask.metaClass.respondsTo(concatTask, 'extractRequires')?.size() > 0
+		if(canExtract)
+			requires = concatTask.extractRequires()?.files?.toList() ?: []
+	} catch(Exception e) {
+		project.logger.warn("Unable to extract requires for ${concatTask.path}: ${e.message}")
+	}
+
+	Map<String, List<File>> bySuffix = [:].withDefault { [] }
+	requires.each { File f ->
+		bySuffix[ext.z8DebugSourcemap.fileSuffixKey(f)] << f
+	}
+
+	List<File> ordered = []
+	List<String> includePatterns = []
+	if(concatTask.metaClass.hasProperty(concatTask, 'requiresInclude'))
+		includePatterns = (concatTask.requiresInclude ?: []) as List<String>
+
+	includePatterns.each { String includePattern ->
+		String normalizedPattern = ext.z8DebugSourcemap.normalizeSlashes(includePattern)
+		if(!ext.z8DebugSourcemap.hasWildcard(normalizedPattern)) {
+			List<File> matches = bySuffix[normalizedPattern]
+			if(matches == null || matches.isEmpty())
+				throw new GradleException("Cannot resolve require '${normalizedPattern}' for ${concatTask.path}")
+			ordered << matches.first()
+			return
+		}
+
+		String regex = ext.z8DebugSourcemap.antPatternToRegex(normalizedPattern)
+		List<File> matches = requires.findAll { File f ->
+			ext.z8DebugSourcemap.fileSuffixKey(f) ==~ regex
+		}
+		if(matches.isEmpty())
+			throw new GradleException("Cannot resolve wildcard require '${normalizedPattern}' for ${concatTask.path}")
+		ordered.addAll(matches)
+	}
+
+	ordered
+}
+
+ext.z8DebugSourcemap.buildLocalConcatIndex = {
+	Map<String, Map> localIndex = [:]
+	project.rootProject.allprojects.each { Project p ->
+		def concatTask = p.tasks.findByName('concatJs')
+		if(concatTask == null)
+			return
+		try {
+			File outFile = concatTask.output.asFile.get()
+			String key = "web/${outFile.name}"
+			if(localIndex.containsKey(key)) {
+				project.logger.warn("Duplicate concatJs output key '${key}' for ${p.path} and ${localIndex[key].project.path}; using first")
+				return
+			}
+			localIndex[key] = [project: p, task: concatTask]
+		} catch(Exception ignored) {
+		}
+	}
+	localIndex
+}
+
+ext.z8DebugSourcemap.parseExpandedArchiveRequire = { File requiredFile ->
+	String normalized = ext.z8DebugSourcemap.normalizeSlashes(requiredFile.absolutePath)
+	def matcher = (normalized =~ /\/expandedArchives\/([^\/]+)\/web\/([^\/]+\.js)$/)
+	if(!matcher.find())
+		return null
+
+	String archiveName = matcher.group(1)
+	String webFileName = matcher.group(2)
+	def artifactMatcher = (archiveName =~ /^(.*)-([0-9][^\/]*)\.(?:zip|jsar)(?:_.*)?$/)
+	if(!artifactMatcher.find())
+		return null
+
+	[artifactId: artifactMatcher.group(1), webFileName: webFileName, archiveName: archiveName]
+}
+
+ext.z8DebugSourcemap.findLocalProjectDirByArtifactId = { String artifactId ->
+	if(artifactId == null || artifactId.isEmpty())
+		return null
+	File rootDir = project.rootProject.rootDir
+	for(String searchRoot : (ext.z8DebugSourcemap.localProjectSearchRoots as List<String>)) {
+		String rel = ext.z8DebugSourcemap.trimSlashes(searchRoot)
+		File baseDir = (rel == null || rel.isEmpty() || rel == '.') ? rootDir : new File(rootDir, rel)
+		File candidate = new File(baseDir, artifactId)
+		if(candidate.isDirectory())
+			return candidate
+	}
+	return null
+}
+
+ext.z8DebugSourcemap.guessBuildorderForWebFile = { String webFileName ->
+	webFileName != null && webFileName.endsWith('.server.js') ? '.server.buildorder' : '.buildorder'
+}
+
+ext.z8DebugSourcemap.tryCollectExpandedArchiveConcatSegments = { File requiredFile ->
+	Map info = ext.z8DebugSourcemap.parseExpandedArchiveRequire(requiredFile)
+	if(info == null)
+		return null
+
+	File localProjectDir = ext.z8DebugSourcemap.findLocalProjectDirByArtifactId(String.valueOf(info.artifactId))
+	if(localProjectDir == null)
+		return null
+
+	List<String> buildorders = [ext.z8DebugSourcemap.guessBuildorderForWebFile(String.valueOf(info.webFileName)), '.buildorder']
+	buildorders = buildorders.findAll { it != null }.unique()
+
+	for(String sourceRoot : (ext.z8DebugSourcemap.concatSourceRoots as List<String>)) {
+		File sourceDir = new File(localProjectDir, ext.z8DebugSourcemap.trimSlashes(sourceRoot))
+		if(!sourceDir.isDirectory())
+			continue
+
+		for(String buildorderName : buildorders) {
+			List<File> files = ext.z8DebugSourcemap.readBuildorderFiles(sourceDir, buildorderName)
+			if(files.isEmpty())
+				continue
+
+			return files.collect { File src ->
+				new Z8SmSegment(
+					file: src,
+					sourcePath: ext.z8DebugSourcemap.relativeSourcePath(src),
+					content: src.getText(SM_ENCODING)
+				)
+			}
+		}
+	}
+
+	return null
+}
+
+ext.z8DebugSourcemap.shouldRecurseLocalConcat = { Project localProject, def localConcatTask ->
+	File sourceDir = null
+	try {
+		sourceDir = localConcatTask.source?.asFile?.get()
+	} catch(Exception ignored) {
+	}
+	if(sourceDir == null)
+		return false
+	ext.z8DebugSourcemap.sourceDirAllowed(sourceDir)
+}
+
+ext.z8DebugSourcemap.collectSegments = { Project ownerProject, def concatTask, Map<String, Map> localConcatIndex, LinkedHashSet<String> callStack ->
+	String stackKey = ownerProject.path
+	if(callStack.contains(stackKey))
+		throw new GradleException("concatJs dependency cycle detected: ${(callStack + [stackKey]).join(' -> ')}")
+
+	callStack << stackKey
+	List<Z8SmSegment> segments = []
+	try {
+		List<File> requiredFiles = ext.z8DebugSourcemap.resolveRequireFiles(concatTask)
+		(requiredFiles).each { File requiredFile ->
+			String suffixKey = ext.z8DebugSourcemap.fileSuffixKey(requiredFile)
+			Map local = localConcatIndex[suffixKey]
+			if(local != null && local.project != ownerProject && ext.z8DebugSourcemap.shouldRecurseLocalConcat(local.project as Project, local.task)) {
+				segments.addAll(ext.z8DebugSourcemap.collectSegments(local.project as Project, local.task, localConcatIndex, callStack))
+				segments << new Z8SmSegment(separatorOnly: true)
+			} else {
+				List<Z8SmSegment> expandedArchiveSegments = ext.z8DebugSourcemap.tryCollectExpandedArchiveConcatSegments(requiredFile)
+				if(expandedArchiveSegments != null && !expandedArchiveSegments.isEmpty()) {
+					segments.addAll(expandedArchiveSegments)
+					segments << new Z8SmSegment(separatorOnly: true)
+				} else {
+					segments << new Z8SmSegment(
+						file: requiredFile,
+						sourcePath: ext.z8DebugSourcemap.relativeSourcePath(requiredFile),
+						content: requiredFile.getText(SM_ENCODING)
+					)
+				}
+			}
+		}
+
+		File sourceDir = null
+		try {
+			sourceDir = concatTask.source?.asFile?.get()
+		} catch(Exception ignored) {
+		}
+
+		ext.z8DebugSourcemap.readBuildorderFiles(sourceDir, concatTask.buildorder).each { File src ->
+			segments << new Z8SmSegment(
+				file: src,
+				sourcePath: ext.z8DebugSourcemap.relativeSourcePath(src),
+				content: src.getText(SM_ENCODING)
+			)
+		}
+	} finally {
+		callStack.remove(stackKey)
+	}
+
+	segments
+}
+
+ext.z8DebugSourcemap.buildMappings = { List<Z8SmSegment> segments, Map<String, Integer> sourceIndexByPath ->
+	StringBuilder mappings = new StringBuilder()
+	// Tracks whether we're already at the start of the current generated line.
+	boolean atGeneratedLineStart = true
+	int prevSourceIndex = 0
+	int prevSourceLine = 0
+	int prevSourceColumn = 0
+
+	segments.each { Z8SmSegment seg ->
+		if(seg.separatorOnly) {
+			mappings.append(';')
+			atGeneratedLineStart = true
+			return
+		}
+
+		int sourceIndex = sourceIndexByPath[seg.sourcePath]
+		String[] sourceLines = seg.content.split(/\n/, -1)
+
+		for(int lineNo = 0; lineNo < sourceLines.length; lineNo++) {
+			if(!atGeneratedLineStart)
+				mappings.append(';')
+			atGeneratedLineStart = false
+
+			mappings.append(ext.z8DebugSourcemap.encodeVlq(0))
+			mappings.append(ext.z8DebugSourcemap.encodeVlq(sourceIndex - prevSourceIndex))
+			mappings.append(ext.z8DebugSourcemap.encodeVlq(lineNo - prevSourceLine))
+			mappings.append(ext.z8DebugSourcemap.encodeVlq(0 - prevSourceColumn))
+
+			prevSourceIndex = sourceIndex
+			prevSourceLine = lineNo
+			prevSourceColumn = 0
+		}
+
+		mappings.append(';')
+		atGeneratedLineStart = true
+	}
+
+	mappings.toString()
+}
+
+ext.z8DebugSourcemap.withInjectedSourceMapComment = { String jsText, String mapFileName ->
+	String cleaned = jsText.replaceFirst(/(?s)\n?\/\/# sourceMappingURL=[^\r\n]+\s*\z/, '')
+	if(!cleaned.endsWith('\n'))
+		cleaned += '\n'
+	cleaned + "//# sourceMappingURL=${mapFileName}\n"
+}
+
+if(tasks.findByName('generateDebugJsSourceMap') == null) {
+	task generateDebugJsSourceMap {
+		group = 'Z8 debug'
+		description = 'Generate source map for target/web/debug/*.js used by debug.html'
+
+		def assembleJsTask = tasks.findByName('assembleJs')
+		if(assembleJsTask != null)
+			dependsOn assembleJsTask
+
+		doLast {
+			def smh = project.ext.z8DebugSourcemap
+			def concatTask = tasks.findByName('concatJs')
+			if(concatTask == null)
+				throw new GradleException("Task 'concatJs' not found in ${project.path}")
+
+			File debugJs = smh.findDebugEntryScript()
+			if(!debugJs.exists()) {
+				logger.lifecycle("debug entry script not found (${debugJs}); skipping sourcemap generation")
+				return
+			}
+
+			Map<String, Map> localConcatIndex = smh.buildLocalConcatIndex()
+			List<Z8SmSegment> segments = smh.collectSegments(project, concatTask, localConcatIndex, new LinkedHashSet<String>())
+			if(segments.isEmpty())
+				throw new GradleException("No JS sources resolved for ${concatTask.path}")
+
+				String expectedDebugJs = segments.collect { Z8SmSegment seg -> seg.separatorOnly ? '\n' : (seg.content + '\n') }.join('')
+			String actualDebugJs = debugJs.getText(SM_ENCODING)
+
+			if(expectedDebugJs != actualDebugJs) {
+				int mismatchAt = -1
+				int maxLen = Math.min(expectedDebugJs.length(), actualDebugJs.length())
+				for(int i = 0; i < maxLen; i++) {
+					if(expectedDebugJs.charAt(i) != actualDebugJs.charAt(i)) {
+						mismatchAt = i
+						break
+					}
+				}
+				if(mismatchAt < 0 && expectedDebugJs.length() != actualDebugJs.length())
+					mismatchAt = maxLen
+
+				File expectedDump = new File(debugJs.parentFile, "${debugJs.name}.expected.reconstructed")
+				expectedDump.setText(expectedDebugJs, SM_ENCODING)
+				int from = Math.max(0, mismatchAt - 120)
+				int toExpected = Math.min(expectedDebugJs.length(), mismatchAt + 120)
+				int toActual = Math.min(actualDebugJs.length(), mismatchAt + 120)
+				String expectedSnippet = expectedDebugJs.substring(from, toExpected).replace('\n', '\\n')
+				String actualSnippet = actualDebugJs.substring(from, toActual).replace('\n', '\\n')
+				logger.lifecycle("Expected reconstructed dump: ${project.relativePath(expectedDump)}")
+				logger.lifecycle("Mismatch expected snippet: ${expectedSnippet}")
+				logger.lifecycle("Mismatch actual snippet:   ${actualSnippet}")
+					int cursor = 0
+					for(int idx = 0; idx < segments.size(); idx++) {
+						Z8SmSegment seg = segments[idx]
+						int segLen = seg.separatorOnly ? 1 : (seg.content.length() + 1)
+						if(mismatchAt < cursor + segLen) {
+							int inSeg = mismatchAt - cursor
+							String segPath = seg.separatorOnly ? '<separator-only>' : seg.sourcePath
+							String nextPath = (idx + 1 < segments.size()) ? (segments[idx + 1].separatorOnly ? '<separator-only>' : segments[idx + 1].sourcePath) : '<eof>'
+							logger.lifecycle("Mismatch segment: ${segPath} (segmentIndex=${idx}, offsetInSegment=${inSeg}, segmentLength=${segLen})")
+							logger.lifecycle("Next segment: ${nextPath}")
+							break
+						}
+					cursor += segLen
+				}
+
+				throw new GradleException(
+					"Refusing to write sourcemap: reconstructed concatJs content does not match ${debugJs}. " +
+					"Mismatch at byte ${mismatchAt}, expected length ${expectedDebugJs.length()}, actual length ${actualDebugJs.length()}."
+				)
+			}
+
+				LinkedHashMap<String, Integer> sourceIndexByPath = new LinkedHashMap<>()
+				LinkedHashMap<String, String> sourceContentByPath = new LinkedHashMap<>()
+				segments.each { Z8SmSegment seg ->
+					if(seg.separatorOnly)
+						return
+					if(!sourceIndexByPath.containsKey(seg.sourcePath)) {
+						sourceIndexByPath[seg.sourcePath] = sourceIndexByPath.size()
+						sourceContentByPath[seg.sourcePath] = seg.content
+					}
+				}
+
+			String mappings = smh.buildMappings(segments, sourceIndexByPath)
+			File mapFile = new File(debugJs.parentFile, "${debugJs.name}.map")
+			mapFile.parentFile.mkdirs()
+
+				Map sm = [
+					version       : 3,
+					file          : debugJs.name,
+					sources       : new ArrayList<String>(sourceIndexByPath.keySet()),
+					sourcesContent: new ArrayList<String>(sourceContentByPath.values()),
+					names         : [],
+					mappings      : mappings
+				]
+			mapFile.setText(JsonOutput.toJson(sm), SM_ENCODING)
+
+			debugJs.setText(smh.withInjectedSourceMapComment(actualDebugJs, mapFile.name), SM_ENCODING)
+
+			logger.lifecycle("Generated debug sourcemap: ${project.relativePath(mapFile)} (${sourceIndexByPath.size()} sources)")
+		}
+	}
+}
+
+if(tasks.findByName('printConcatJsSourcemapMeta') == null) {
+	task printConcatJsSourcemapMeta {
+		group = 'Z8 debug'
+		description = 'Print concatJs meta used by z8-debug-sourcemaps diagnostics'
+		doLast {
+			rootProject.allprojects.each { Project p ->
+				def t = p.tasks.findByName('concatJs')
+				if(t == null)
+					return
+				File sourceDir = null
+				try { sourceDir = t.source?.asFile?.get() } catch(Exception ignored) {}
+				def before = t.metaClass.hasProperty(t, 'beforeSource') ? t.beforeSource : '<n/a>'
+				def after = t.metaClass.hasProperty(t, 'afterSource') ? t.afterSource : '<n/a>'
+				def includes = t.metaClass.hasProperty(t, 'requiresInclude') ? t.requiresInclude : '<n/a>'
+				println "${p.path}"
+				println "  source=${sourceDir}"
+				println "  buildorder=${t.metaClass.hasProperty(t, 'buildorder') ? t.buildorder : '<n/a>'}"
+				println "  beforeSource=${before}"
+				println "  afterSource=${after}"
+				println "  requiresInclude=${includes}"
+			}
+		}
+	}
+}
+
+// Auto-run after assembleJs when this script is applied into the root build.gradle.
+def assembleJsTask = tasks.findByName('assembleJs')
+if(assembleJsTask != null) {
+	assembleJsTask.finalizedBy(tasks.getByName('generateDebugJsSourceMap'))
+}
