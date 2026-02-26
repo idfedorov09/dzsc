@@ -1,0 +1,424 @@
+/* AGENTATION_GRADLE_HOOK_BEGIN */
+apply plugin: 'base'
+
+ext.agentationOverlayConfig = [
+	agentationVersion: '2.2.1',
+	reactVersion     : '18.3.1',
+	esbuildVersion   : '0.25.10',
+	autoIdRegex      : '^id\\d+$',
+	workDir          : file("${projectDir}/target/agentation-overlay-work"),
+	outputDir        : file("${projectDir}/target/web/debug/agentation")
+]
+
+def isWindows = System.getProperty('os.name').toLowerCase().contains('win')
+def npmCmd = isWindows ? 'npm.cmd' : 'npm'
+def npxCmd = isWindows ? 'npx.cmd' : 'npx'
+
+def writeText = { File file, String content ->
+	file.parentFile.mkdirs()
+	file.setText(content, 'UTF-8')
+}
+
+task agentationOverlayClean(type: Delete) {
+	group = 'Build'
+	description = 'Removes generated Agentation overlay workspace and output'
+	delete agentationOverlayConfig.workDir, agentationOverlayConfig.outputDir
+}
+
+task agentationOverlayPrepare {
+	group = 'Build'
+	description = 'Generates an isolated React 18 + Agentation workspace (dev-only)'
+
+	outputs.dir agentationOverlayConfig.workDir
+
+	doLast {
+		File workDir = agentationOverlayConfig.workDir
+		File srcDir = new File(workDir, 'src')
+
+		writeText(new File(workDir, 'package.json'), """{
+  "name": "doczilla-agentation-overlay-build",
+  "private": true,
+  "version": "1.0.0",
+  "scripts": {
+    "build": "esbuild src/main.jsx --bundle --format=iife --platform=browser --target=es2018 --minify --sourcemap --outfile=${agentationOverlayConfig.outputDir.absolutePath.replace('\\\\', '\\\\\\\\')}/agentation-overlay.js"
+  },
+  "dependencies": {
+    "agentation": "${agentationOverlayConfig.agentationVersion}",
+    "react": "${agentationOverlayConfig.reactVersion}",
+    "react-dom": "${agentationOverlayConfig.reactVersion}"
+  },
+  "devDependencies": {
+    "esbuild": "${agentationOverlayConfig.esbuildVersion}"
+  }
+}
+""")
+
+		writeText(new File(srcDir, 'main.jsx'), '''import React from "react";
+import { createRoot } from "react-dom/client";
+import { Agentation } from "agentation";
+
+function emit(name, detail) {
+  try {
+    window.dispatchEvent(new CustomEvent(name, { detail }));
+  } catch (error) {
+    console.warn("[agentation-overlay] event dispatch failed:", error);
+  }
+}
+
+function initAgentationOverlay() {
+  if (typeof window === "undefined" || typeof document === "undefined") {
+    return;
+  }
+
+  if (window.__DOCZILLA_AGENTATION_OVERLAY__) {
+    return;
+  }
+
+  const mountNode = document.createElement("div");
+  mountNode.id = "doczilla-agentation-overlay-root";
+  mountNode.style.position = "fixed";
+  mountNode.style.width = "0";
+  mountNode.style.height = "0";
+  mountNode.style.overflow = "hidden";
+  mountNode.style.zIndex = "2147483000";
+  document.body.appendChild(mountNode);
+
+  let styleFixNode = document.getElementById("doczilla-agentation-style-fix");
+  let ownsStyleFixNode = false;
+  if (!styleFixNode) {
+    styleFixNode = document.createElement("style");
+    styleFixNode.id = "doczilla-agentation-style-fix";
+    styleFixNode.textContent = `
+[data-feedback-toolbar] {
+  overflow: visible !important;
+}
+[data-feedback-toolbar] > [class*="toolbarContainer"] {
+  overflow: visible !important;
+}
+`;
+    (document.head || document.documentElement).appendChild(styleFixNode);
+    ownsStyleFixNode = true;
+  }
+
+  const root = createRoot(mountNode);
+  const externalConfig = window.__DOCZILLA_AGENTATION_CONFIG__ || {};
+
+  const teardown = () => {
+    try {
+      root.unmount();
+    } finally {
+      mountNode.remove();
+      if (ownsStyleFixNode) {
+        styleFixNode?.remove();
+      }
+      delete window.__DOCZILLA_AGENTATION_OVERLAY__;
+    }
+  };
+
+  window.__DOCZILLA_AGENTATION_OVERLAY__ = {
+    mountedAt: Date.now(),
+    teardown
+  };
+
+  root.render(
+    React.createElement(Agentation, {
+      copyToClipboard: externalConfig.copyToClipboard !== false,
+      endpoint: externalConfig.endpoint,
+      sessionId: externalConfig.sessionId,
+      webhookUrl: externalConfig.webhookUrl,
+      onSessionCreated: (sessionId) => {
+        emit("doczilla:agentation:session-created", { sessionId });
+        if (typeof externalConfig.onSessionCreated === "function") {
+          externalConfig.onSessionCreated(sessionId);
+        }
+      },
+      onAnnotationAdd: (annotation) => {
+        emit("doczilla:agentation:annotation-add", { annotation });
+        if (typeof externalConfig.onAnnotationAdd === "function") {
+          externalConfig.onAnnotationAdd(annotation);
+        }
+      },
+      onAnnotationUpdate: (annotation) => {
+        emit("doczilla:agentation:annotation-update", { annotation });
+        if (typeof externalConfig.onAnnotationUpdate === "function") {
+          externalConfig.onAnnotationUpdate(annotation);
+        }
+      },
+      onAnnotationDelete: (annotation) => {
+        emit("doczilla:agentation:annotation-delete", { annotation });
+        if (typeof externalConfig.onAnnotationDelete === "function") {
+          externalConfig.onAnnotationDelete(annotation);
+        }
+      },
+      onAnnotationsClear: (annotations) => {
+        emit("doczilla:agentation:annotations-clear", { annotations });
+        if (typeof externalConfig.onAnnotationsClear === "function") {
+          externalConfig.onAnnotationsClear(annotations);
+        }
+      },
+      onCopy: (markdown) => {
+        emit("doczilla:agentation:copy", { markdown });
+        if (typeof externalConfig.onCopy === "function") {
+          externalConfig.onCopy(markdown);
+        } else {
+          console.info("[agentation-overlay] copied annotations markdown", markdown);
+        }
+      },
+      onSubmit: (output, annotations) => {
+        emit("doczilla:agentation:submit", { output, annotations });
+        if (typeof externalConfig.onSubmit === "function") {
+          externalConfig.onSubmit(output, annotations);
+        } else {
+          console.info("[agentation-overlay] submit", { output, annotations });
+        }
+      }
+    })
+  );
+}
+
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", initAgentationOverlay, { once: true });
+} else {
+  initAgentationOverlay();
+}
+''')
+
+		writeText(new File(agentationOverlayConfig.outputDir, 'README.txt'), """Agentation overlay build output (dev-only)
+
+Generated by Gradle task: agentationOverlay
+
+Files:
+- agentation-overlay.js        bundled React 18 + Agentation overlay
+- agentation-overlay.js.map    source map
+
+Usage idea (manual/dev only):
+<script src="/debug/agentation/agentation-overlay.js"></script>
+
+Optional runtime config before loading script:
+window.__DOCZILLA_AGENTATION_CONFIG__ = {
+  copyToClipboard: true,
+  onCopy: function(markdown) { console.log(markdown); }
+};
+""")
+
+		writeText(new File(agentationOverlayConfig.outputDir, 'preview.html'), '''<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agentation Overlay Preview</title>
+    <style>
+      body { font-family: sans-serif; margin: 2rem; line-height: 1.4; }
+      .card { border: 1px solid #ddd; border-radius: 12px; padding: 1rem; max-width: 640px; }
+      button { border: 0; background: #0f766e; color: #fff; padding: 0.65rem 0.9rem; border-radius: 8px; cursor: pointer; }
+      input { width: 100%; margin-top: 0.75rem; padding: 0.55rem; border: 1px solid #bbb; border-radius: 8px; }
+    </style>
+    <script>
+      window.__DOCZILLA_AGENTATION_CONFIG__ = {
+        onCopy: function(markdown) {
+          console.log("[preview] onCopy", markdown);
+        }
+      };
+    </script>
+  </head>
+  <body>
+    <h1>Agentation Overlay Preview</h1>
+    <div class="card">
+      <p>Use the Agentation toolbar (bottom-right) to annotate elements on this page.</p>
+      <button type="button">Sample Action</button>
+      <input placeholder="Sample input field" />
+    </div>
+    <script src="./agentation-overlay.js"></script>
+  </body>
+</html>
+''')
+	}
+}
+
+task agentationOverlayNpmInstall(type: Exec) {
+	group = 'Build'
+	description = 'Installs npm dependencies for isolated Agentation overlay workspace'
+	dependsOn agentationOverlayPrepare
+	workingDir agentationOverlayConfig.workDir
+
+	inputs.file new File(agentationOverlayConfig.workDir, 'package.json')
+	outputs.dir new File(agentationOverlayConfig.workDir, 'node_modules')
+
+	commandLine npmCmd, 'install', '--no-fund', '--no-audit'
+}
+
+task agentationOverlayPatchAgentation {
+	group = 'Build'
+	description = 'Patches agentation internals for legacy integration (auto-id selectors + multi-class paths + robust toolbar clicks)'
+	dependsOn agentationOverlayNpmInstall
+
+	def distDir = new File(agentationOverlayConfig.workDir, 'node_modules/agentation/dist')
+	def distFiles = [
+		new File(distDir, 'index.mjs'),
+		new File(distDir, 'index.js')
+	]
+
+	inputs.files(distFiles)
+	outputs.files(distFiles)
+
+	doLast {
+		String selectorFrom = 'if (current.id) {'
+		String selectorTo = "if (current.id && !/${agentationOverlayConfig.autoIdRegex}/.test(current.id)) {"
+
+		String closestFrom = '''let current = element;
+  while (current) {
+    if (current.matches(selector)) return current;'''
+		String closestTo = '''let current = element instanceof Element ? element : element?.parentElement || (element?.parentNode instanceof Element ? element.parentNode : null);
+  while (current) {
+    if (current.matches(selector)) return current;'''
+
+		String settingsClickFrom = '''onClick: (e) => {
+                              e.stopPropagation();
+                              hideTooltipsUntilMouseLeave();
+                              setShowSettings(!showSettings);
+                            },'''
+		String settingsClickTo = '''onMouseDown: (e) => {
+                              e.preventDefault();
+                              e.stopPropagation();
+                              hideTooltipsUntilMouseLeave();
+                              setShowSettings((prev) => !prev);
+                            },'''
+
+		String elementPathClassFrom = '''      const meaningfulClass = current.className.split(/\\s+/).find((c) => c.length > 2 && !c.match(/^[a-z]{1,2}$/) && !c.match(/[A-Z0-9]{5,}/));
+      if (meaningfulClass) {
+        identifier = `.${meaningfulClass.split("_")[0]}`;
+      }'''
+		String elementPathClassTo = '''      const classes = Array.from(new Set(
+        current.className.split(/\\s+/).map((c) => c.replace(/[_][a-zA-Z0-9]{5,}.*$/, "")).filter((c) => c.length > 2 && !c.match(/^[a-z]{1,2}$/) && !c.match(/[A-Z0-9]{5,}/))
+      )).slice(0, 6);
+      if (classes.length) {
+        identifier = classes.map((c) => `.${c}`).join("");
+      }'''
+
+		String fullPathClassFrom = '''      const cls = current.className.split(/\\s+/).map((c) => c.replace(/[_][a-zA-Z0-9]{5,}.*$/, "")).find((c) => c.length > 2);
+      if (cls) identifier = `${tag}.${cls}`;'''
+		String fullPathClassTo = '''      const classes = Array.from(new Set(
+        current.className.split(/\\s+/).map((c) => c.replace(/[_][a-zA-Z0-9]{5,}.*$/, "")).filter((c) => c.length > 2 && !/[A-Z0-9]{5,}/.test(c))
+      )).slice(0, 6);
+      if (classes.length) identifier = `${tag}.${classes.join(".")}`;'''
+
+		def countOccurrences = { String text, String needle ->
+			int count = 0
+			int idx = 0
+			while ((idx = text.indexOf(needle, idx)) != -1) {
+				count++
+				idx += needle.length()
+			}
+			return count
+		}
+
+		def applyIdempotentPatch = { File file, String label, String from, String to, int expectedCount ->
+			String content = file.getText('UTF-8')
+			int fromOccurrences = countOccurrences(content, from)
+			int toOccurrences = countOccurrences(content, to)
+
+			if (fromOccurrences == expectedCount && toOccurrences == 0) {
+				file.setText(content.replace(from, to), 'UTF-8')
+				logger.lifecycle("Patched Agentation ${label} in ${file.name}")
+				return
+			}
+
+			if (fromOccurrences == 0 && toOccurrences == expectedCount) {
+				logger.lifecycle("Agentation ${label} already patched in ${file.name}")
+				return
+			}
+
+			throw new GradleException(
+				"Unexpected agentation ${label} code shape in ${file.name}: expected either ${expectedCount}x original or ${expectedCount}x patched, found original=${fromOccurrences}, patched=${toOccurrences}"
+			)
+		}
+
+		distFiles.each { File file ->
+			if (!file.exists()) {
+				throw new GradleException("Agentation dist file not found: ${file}")
+			}
+
+			applyIdempotentPatch(
+				file,
+				"selectors (ignore auto ids /${agentationOverlayConfig.autoIdRegex}/)",
+				selectorFrom,
+				selectorTo,
+				2
+			)
+			applyIdempotentPatch(
+				file,
+				"closestCrossingShadow target normalization",
+				closestFrom,
+				closestTo,
+				1
+			)
+			applyIdempotentPatch(
+				file,
+				"settings button mousedown toggle",
+				settingsClickFrom,
+				settingsClickTo,
+				1
+			)
+			applyIdempotentPatch(
+				file,
+				"getElementPath multi-class selectors",
+				elementPathClassFrom,
+				elementPathClassTo,
+				1
+			)
+			applyIdempotentPatch(
+				file,
+				"getFullElementPath multi-class selectors",
+				fullPathClassFrom,
+				fullPathClassTo,
+				1
+			)
+		}
+	}
+}
+
+task agentationOverlayBuild(type: Exec) {
+	group = 'Build'
+	description = 'Builds isolated Agentation overlay bundle into target/web/debug/agentation'
+	dependsOn agentationOverlayPatchAgentation
+	workingDir agentationOverlayConfig.workDir
+
+	inputs.file new File(agentationOverlayConfig.workDir, 'src/main.jsx')
+	inputs.file new File(agentationOverlayConfig.workDir, 'package.json')
+	outputs.file new File(agentationOverlayConfig.outputDir, 'agentation-overlay.js')
+
+	doFirst {
+		agentationOverlayConfig.outputDir.mkdirs()
+	}
+
+	commandLine npxCmd, 'esbuild', 'src/main.jsx',
+		'--bundle',
+		'--format=iife',
+		'--platform=browser',
+		'--target=es2018',
+		'--minify',
+		'--sourcemap',
+		"--outfile=${new File(agentationOverlayConfig.outputDir, 'agentation-overlay.js').absolutePath}"
+}
+
+task agentationOverlay {
+	group = 'Build'
+	description = 'Builds a dev-only standalone Agentation overlay (React 18 isolated from legacy UI)'
+	dependsOn agentationOverlayBuild
+}
+
+task agentationOverlayRebuild {
+	group = 'Build'
+	description = 'Cleans and rebuilds the dev-only standalone Agentation overlay'
+	dependsOn agentationOverlayClean, agentationOverlay
+}
+
+agentationOverlay.mustRunAfter agentationOverlayClean
+afterEvaluate {
+    def assembleWebTask = tasks.findByName("assembleWeb")
+    def overlayTask = tasks.findByName("agentationOverlay")
+    if (assembleWebTask != null && overlayTask != null) {
+        assembleWebTask.dependsOn overlayTask
+    }
+}
+/* AGENTATION_GRADLE_HOOK_END */
