@@ -15,7 +15,15 @@ class StageRunContext:
     sourcemap_config: Path | None = None
     concat_source_roots: tuple[str, ...] = ()
     local_project_search_roots: tuple[str, ...] = ()
+    debug_html_path: Path | None = None
+    overlay_dir_path: Path | None = None
     verbose: bool = False
+
+
+@dataclass(slots=True)
+class StageInvocation:
+    stage_name: str
+    overrides: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

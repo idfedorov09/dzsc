@@ -7,7 +7,6 @@ from importlib.resources.abc import Traversable
 _PAYLOADS = {
     "agentation_gradle": "static/gradle/agentation-debug-overlay.gradle",
     "sourcemap_gradle": "static/gradle/z8-debug-sourcemaps.gradle",
-    "sourcemap_toggle_py": "static/tools/toggle_z8_debug_sourcemaps.py",
     "sourcemap_config": "static/config/frontend_debug_sourcemap.yml",
 }
 
