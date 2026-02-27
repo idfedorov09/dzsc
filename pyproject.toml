@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling>=1.24"]
+build-backend = "hatchling.build"
+
+[project]
+name = "dzsc"
+version = "0.1.0"
+description = "Doczilla stage controller (one-shot debug tooling CLI)"
+requires-python = ">=3.10"
+dependencies = [
+  "click>=8.1,<9",
+  "rich-click>=1.8,<2",
+]
+
+[project.scripts]
+dzsc = "dzsc.cli:main"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dzsc"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/dzsc/static" = "dzsc/static"
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src/dzsc",
+  "/pyproject.toml",
+  "/uv.lock",
+]

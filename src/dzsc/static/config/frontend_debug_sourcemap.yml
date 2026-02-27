@@ -1,4 +1,4 @@
-# Default settings for Makefile_frontend_debug.
+# Default settings for dzsc stage `dz_source_maps`.
 # All paths are relative to the project root where build.gradle/gradlew live.
 
 # Concat source directories that can be expanded into original files.

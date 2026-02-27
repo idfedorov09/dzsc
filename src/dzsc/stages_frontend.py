@@ -1,20 +1,17 @@
-.PHONY: help generateDebugJsSourceMap
-
-PYTHON ?= python3
-PROJECT ?= $(CURDIR)
-PROJECT_DIR = $(abspath $(PROJECT))
-SCRIPT_DIR = $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-CONFIG ?= $(SCRIPT_DIR)frontend_debug_sourcemap.yml
-CONCAT_SOURCE_ROOTS ?=
-LOCAL_PROJECT_SEARCH_ROOTS ?=
-
-GRADLE_PAYLOAD_FILE ?= $(SCRIPT_DIR)z8-debug-sourcemaps.gradle
-TOGGLE_PY_FILE ?= $(SCRIPT_DIR)toggle_z8_debug_sourcemaps.py
-
-define Z8_DEBUG_SOURCEMAPS_RUNNER_PY
 from __future__ import annotations
-import os, re, shutil, stat, subprocess, sys
+
+import os
+import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
+
+from dzsc.common import detect_newline, ensure_project_dir, make_user_executable, restore_file, rmdir_if_empty
+from dzsc.common import resolve_gradle_wrapper
+from dzsc.payloads import payload_bytes, payload_text
+from dzsc.sdk import StageRunContext, stage
+
 
 MANAGED_START_MARKER = "// >>> z8-debug-sourcemaps (managed)"
 MANAGED_END_MARKER = "// <<< z8-debug-sourcemaps (managed)"
@@ -22,20 +19,6 @@ MANAGED_APPLY_LINES = (
     "apply from: '.dzsc/gradle/z8-debug-sourcemaps.gradle'",
     "apply from: 'gradle/z8-debug-sourcemaps.gradle'",  # legacy path from older helper versions
 )
-
-def restore_file(path: Path, backup: Path | None) -> None:
-    if backup is not None and backup.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(backup, path)
-    else:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-
-
-def _detect_newline(data: bytes) -> bytes:
-    return b"\r\n" if b"\r\n" in data else b"\n"
 
 
 def _strip_stale_managed_build_block(build_gradle: Path) -> None:
@@ -47,7 +30,7 @@ def _strip_stale_managed_build_block(build_gradle: Path) -> None:
     if not has_start and not has_end:
         return
 
-    nl = _detect_newline(data)
+    nl = detect_newline(data)
     for apply_line in MANAGED_APPLY_LINES:
         apply_b = apply_line.encode("utf-8")
         exact_block = nl + start_b + nl + apply_b + nl + end_b + nl
@@ -57,7 +40,6 @@ def _strip_stale_managed_build_block(build_gradle: Path) -> None:
             print(f"cleaned stale managed sourcemap hook from {build_gradle}")
             return
 
-    # Fallback tolerant to whitespace/newline variants left by previous runs.
     for apply_line in MANAGED_APPLY_LINES:
         apply_b = apply_line.encode("utf-8")
         pattern = re.compile(
@@ -93,13 +75,6 @@ def _remove_stale_payload_file(path: Path, payload: bytes) -> bool:
     return True
 
 
-def _rmdir_if_empty(path: Path) -> None:
-    try:
-        path.rmdir()
-    except OSError:
-        pass
-
-
 def _parse_csv_list(raw: str | None) -> list[str]:
     if raw is None:
         return []
@@ -111,13 +86,11 @@ def _parse_csv_list(raw: str | None) -> list[str]:
     return values
 
 
-def _parse_simple_yaml_lists(path: Path) -> dict[str, list[str]]:
+def _parse_simple_yaml_lists_text(raw_text: str) -> dict[str, list[str]]:
     result: dict[str, list[str]] = {}
-    if not path.exists():
-        return result
 
     current_key: str | None = None
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    for raw_line in raw_text.splitlines():
         line = raw_line.split("#", 1)[0].rstrip()
         if not line.strip():
             continue
@@ -140,82 +113,89 @@ def _parse_simple_yaml_lists(path: Path) -> dict[str, list[str]]:
     return result
 
 
+def _parse_simple_yaml_lists(path: Path) -> dict[str, list[str]]:
+    if not path.exists():
+        return {}
+    return _parse_simple_yaml_lists_text(path.read_text(encoding="utf-8"))
+
+
+def _normalize_rel_list(values: tuple[str, ...]) -> list[str]:
+    normalized: list[str] = []
+    for value in values:
+        item = value.strip().strip("/").replace("\\", "/")
+        if item:
+            normalized.append(item)
+    return normalized
+
+
 def _resolve_list_setting(
     env_name: str,
     yaml_key: str,
     config: dict[str, list[str]],
     default: list[str],
+    cli_override: tuple[str, ...],
 ) -> list[str]:
+    if cli_override:
+        return _normalize_rel_list(cli_override)
     override = _parse_csv_list(os.environ.get(env_name))
     if override:
         return override
     values = [v.strip().strip("/").replace("\\", "/") for v in config.get(yaml_key, []) if v.strip()]
     return values or default
 
-def main() -> int:
-    project_dir = Path(os.environ['Z8_SM_PROJECT']).resolve()
-    python_bin = os.environ.get('Z8_SM_PYTHON', sys.executable)
-    sm_payload_file = Path(os.environ['Z8_SM_GRADLE_PAYLOAD_FILE']).expanduser().resolve()
-    toggle_payload_file = Path(os.environ['Z8_SM_TOGGLE_PY_FILE']).expanduser().resolve()
-    config_file_env = os.environ.get('Z8_SM_CONFIG_FILE')
 
-    build_gradle = project_dir / 'build.gradle'
-    gradlew = project_dir / 'gradlew'
-    dzsc_dir = project_dir / '.dzsc'
-    tmp_dir = dzsc_dir / 'tmp'
-    sm_gradle = dzsc_dir / 'gradle' / 'z8-debug-sourcemaps.gradle'
-    toggle_script = dzsc_dir / 'tools' / 'toggle_z8_debug_sourcemaps.py'
-    legacy_sm_gradle = project_dir / 'gradle' / 'z8-debug-sourcemaps.gradle'
-    legacy_toggle_script = project_dir / 'tools' / 'toggle_z8_debug_sourcemaps.py'
-    config_file = Path(config_file_env).expanduser() if config_file_env else None
+def run_dz_source_maps(ctx: StageRunContext) -> int:
+    project_dir = ctx.project_dir
+    ensure_project_dir(project_dir)
 
-    if not project_dir.is_dir():
-        print(f'Project directory not found: {project_dir}', file=sys.stderr)
-        return 2
+    python_bin = ctx.python_bin or sys.executable
+    sm_payload_bytes = payload_bytes("sourcemap_gradle")
+    toggle_payload_bytes = payload_bytes("sourcemap_toggle_py")
+
+    build_gradle = project_dir / "build.gradle"
+    dzsc_dir = project_dir / ".dzsc"
+    tmp_dir = dzsc_dir / "tmp"
+    sm_gradle = dzsc_dir / "gradle" / "z8-debug-sourcemaps.gradle"
+    toggle_script = dzsc_dir / "tools" / "toggle_z8_debug_sourcemaps.py"
+    legacy_sm_gradle = project_dir / "gradle" / "z8-debug-sourcemaps.gradle"
+    legacy_toggle_script = project_dir / "tools" / "toggle_z8_debug_sourcemaps.py"
+
     if not build_gradle.is_file():
-        print(f'build.gradle not found: {build_gradle}', file=sys.stderr)
-        return 2
-    if not gradlew.exists() or not os.access(gradlew, os.X_OK):
-        print(f'gradlew not found or not executable: {gradlew}', file=sys.stderr)
-        return 2
+        raise SystemExit(f"build.gradle not found: {build_gradle}")
+    # Validates wrapper presence/executability (and normalizes Windows .bat path).
+    gradle_cmd_base = resolve_gradle_wrapper(project_dir)
 
-    if not sm_payload_file.is_file():
-        print(f'Gradle payload file not found: {sm_payload_file}', file=sys.stderr)
-        return 2
-    if not toggle_payload_file.is_file():
-        print(f'Toggle script payload file not found: {toggle_payload_file}', file=sys.stderr)
-        return 2
-
-    sm_payload_bytes = sm_payload_file.read_bytes()
-    toggle_payload_bytes = toggle_payload_file.read_bytes()
-
-    # Heal stale managed hook left by interrupted/failed earlier run before we take backup.
     _strip_stale_managed_build_block(build_gradle)
-    # Remove stale payload files left by older helper versions (legacy paths) now that build.gradle hook is clean.
+
     removed_legacy_sm = _remove_stale_payload_file(legacy_sm_gradle, sm_payload_bytes)
     removed_legacy_toggle = _remove_stale_payload_file(legacy_toggle_script, toggle_payload_bytes)
     if removed_legacy_sm:
-        _rmdir_if_empty(legacy_sm_gradle.parent)
+        rmdir_if_empty(legacy_sm_gradle.parent)
     if removed_legacy_toggle:
-        _rmdir_if_empty(legacy_toggle_script.parent)
+        rmdir_if_empty(legacy_toggle_script.parent)
 
-    config = _parse_simple_yaml_lists(config_file) if config_file else {}
+    if ctx.sourcemap_config:
+        config = _parse_simple_yaml_lists(ctx.sourcemap_config)
+    else:
+        config = _parse_simple_yaml_lists_text(payload_text("sourcemap_config"))
     concat_source_roots = _resolve_list_setting(
-        'Z8_SM_CONCAT_SOURCE_ROOTS',
-        'concat_source_roots',
+        "Z8_SM_CONCAT_SOURCE_ROOTS",
+        "concat_source_roots",
         config,
-        ['src/main/js', 'src/js'],
+        ["src/main/js", "src/js"],
+        ctx.concat_source_roots,
     )
     local_project_search_roots = _resolve_list_setting(
-        'Z8_SM_LOCAL_PROJECT_SEARCH_ROOTS',
-        'local_project_search_roots',
+        "Z8_SM_LOCAL_PROJECT_SEARCH_ROOTS",
+        "local_project_search_roots",
         config,
-        ['.', 'org.zenframework.z8'],
+        [".", "org.zenframework.z8"],
+        ctx.local_project_search_roots,
     )
 
     had_dzsc_dir = dzsc_dir.is_dir()
-    had_dzsc_gradle_dir = (dzsc_dir / 'gradle').is_dir()
-    had_dzsc_tools_dir = (dzsc_dir / 'tools').is_dir()
+    had_dzsc_gradle_dir = (dzsc_dir / "gradle").is_dir()
+    had_dzsc_tools_dir = (dzsc_dir / "tools").is_dir()
 
     stale_sm_gradle = _same_file_content(sm_gradle, sm_payload_bytes)
     stale_toggle_script = _same_file_content(toggle_script, toggle_payload_bytes)
@@ -227,9 +207,9 @@ def main() -> int:
     had_sm_gradle = sm_gradle.exists() and not stale_sm_gradle
     had_toggle_script = toggle_script.exists() and not stale_toggle_script
 
-    build_backup = tmp_dir / 'build.gradle.bak'
-    sm_gradle_backup = tmp_dir / 'z8-debug-sourcemaps.gradle.orig'
-    toggle_backup = tmp_dir / 'toggle_z8_debug_sourcemaps.py.orig'
+    build_backup = tmp_dir / "build.gradle.bak"
+    sm_gradle_backup = tmp_dir / "z8-debug-sourcemaps.gradle.orig"
+    toggle_backup = tmp_dir / "toggle_z8_debug_sourcemaps.py.orig"
 
     tmp_dir.mkdir(parents=True, exist_ok=True)
     shutil.copy2(build_gradle, build_backup)
@@ -243,44 +223,30 @@ def main() -> int:
         toggle_script.parent.mkdir(parents=True, exist_ok=True)
         sm_gradle.write_bytes(sm_payload_bytes)
         toggle_script.write_bytes(toggle_payload_bytes)
-        toggle_script.chmod(toggle_script.stat().st_mode | stat.S_IXUSR)
+        make_user_executable(toggle_script)
 
-        subprocess.run([python_bin, str(toggle_script), 'on', str(build_gradle)], cwd=str(project_dir), check=True)
+        subprocess.run([python_bin, str(toggle_script), "on", str(build_gradle)], cwd=project_dir, check=True)
+
         gradle_env = os.environ.copy()
-        gradle_env['Z8_SM_CONCAT_SOURCE_ROOTS'] = ','.join(concat_source_roots)
-        gradle_env['Z8_SM_LOCAL_PROJECT_SEARCH_ROOTS'] = ','.join(local_project_search_roots)
-        subprocess.run([str(gradlew), 'generateDebugJsSourceMap'], cwd=str(project_dir), env=gradle_env, check=True)
+        gradle_env["Z8_SM_CONCAT_SOURCE_ROOTS"] = ",".join(concat_source_roots)
+        gradle_env["Z8_SM_LOCAL_PROJECT_SEARCH_ROOTS"] = ",".join(local_project_search_roots)
+        subprocess.run([*gradle_cmd_base, "generateDebugJsSourceMap"], cwd=project_dir, env=gradle_env, check=True)
         return 0
     finally:
         restore_file(build_gradle, build_backup)
         restore_file(sm_gradle, sm_gradle_backup if had_sm_gradle else None)
         restore_file(toggle_script, toggle_backup if had_toggle_script else None)
         if not had_dzsc_tools_dir:
-            try:
-                (dzsc_dir / 'tools').rmdir()
-            except OSError:
-                pass
+            rmdir_if_empty(dzsc_dir / "tools")
         if not had_dzsc_gradle_dir:
-            try:
-                (dzsc_dir / 'gradle').rmdir()
-            except OSError:
-                pass
+            rmdir_if_empty(dzsc_dir / "gradle")
         shutil.rmtree(tmp_dir, ignore_errors=True)
         if not had_dzsc_dir:
-            try:
-                dzsc_dir.rmdir()
-            except OSError:
-                pass
+            rmdir_if_empty(dzsc_dir)
 
-if __name__ == '__main__':
-    raise SystemExit(main())
-endef
-export Z8_DEBUG_SOURCEMAPS_RUNNER_PY
 
-help:
-	@echo "Usage: make -f $(abspath $(lastword $(MAKEFILE_LIST))) generateDebugJsSourceMap [PROJECT=/path]"
-	@echo "Defaults: PROJECT=$(CURDIR), CONFIG=$(CONFIG)"
-	@echo "Optional overrides: CONCAT_SOURCE_ROOTS=src/main/js,src/js LOCAL_PROJECT_SEARCH_ROOTS=.,org.zenframework.z8"
-
-generateDebugJsSourceMap:
-	@Z8_SM_PROJECT="$(PROJECT_DIR)" Z8_SM_PYTHON="$(PYTHON)" Z8_SM_CONFIG_FILE="$(CONFIG)" Z8_SM_CONCAT_SOURCE_ROOTS="$(CONCAT_SOURCE_ROOTS)" Z8_SM_LOCAL_PROJECT_SEARCH_ROOTS="$(LOCAL_PROJECT_SEARCH_ROOTS)" Z8_SM_GRADLE_PAYLOAD_FILE="$(abspath $(GRADLE_PAYLOAD_FILE))" Z8_SM_TOGGLE_PY_FILE="$(abspath $(TOGGLE_PY_FILE))" $(PYTHON) -c "$$Z8_DEBUG_SOURCEMAPS_RUNNER_PY"
+DZ_SOURCE_MAPS_STAGE = stage(
+    "dz_source_maps",
+    "One-shot generateDebugJsSourceMap with temporary Gradle hook and cleanup",
+    aliases=("dz-source-maps", "generate_debug_js_sourcemap"),
+)(run_dz_source_maps)

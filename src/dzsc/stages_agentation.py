@@ -1,24 +1,20 @@
-.PHONY: help injectDebugAgentation generateDebugAgentation removeDebugAgentation agentationStatus
-
-PYTHON ?= python3
-PROJECT ?= $(CURDIR)
-PROJECT_DIR = $(abspath $(PROJECT))
-SCRIPT_DIR = $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
-PAYLOAD_FILE ?= $(SCRIPT_DIR)agentation-debug-overlay.gradle
-
-define AGENTATION_DEBUG_RUNNER_PY
 from __future__ import annotations
 
 import os
 import re
 import shutil
-import subprocess
-import sys
 from pathlib import Path
 
-BUILD_MARKER_START = "// >>> codex-agentation-debug (managed)"
-BUILD_MARKER_END = "// <<< codex-agentation-debug (managed)"
-BUILD_APPLY_REL = "gradle/.codex-agentation-debug.gradle"
+from dzsc.common import detect_newline, ensure_project_dir, restore_file, rmdir_if_empty, run_gradle_task
+from dzsc.payloads import payload_bytes, payload_text
+from dzsc.sdk import StageRunContext, stage
+
+
+BUILD_MARKER_START = "// >>> dzsc-agentation-debug (managed)"
+BUILD_MARKER_END = "// <<< dzsc-agentation-debug (managed)"
+BUILD_APPLY_REL = ".dzsc/gradle/agentation-debug-overlay.gradle"
+LEGACY_BUILD_APPLY_REL = "gradle/.codex-agentation-debug.gradle"
+BUILD_APPLY_RELS = (BUILD_APPLY_REL, LEGACY_BUILD_APPLY_REL)
 PROJECT_AGENTATION_HOOK_MARKER = "AGENTATION_GRADLE_HOOK_BEGIN"
 
 DEBUG_MARKER_BEGIN = "AGENTATION_DEBUG_HTML_BEGIN"
@@ -28,37 +24,60 @@ OVERLAY_DIR_REL = Path("target/web/debug/agentation")
 OVERLAY_JS_REL = OVERLAY_DIR_REL / "agentation-overlay.js"
 
 
-def detect_newline(data: bytes) -> bytes:
-    return b"\r\n" if b"\r\n" in data else b"\n"
-
-
-def restore_file(path: Path, backup: Path | None) -> None:
-    if backup is not None and backup.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(backup, path)
-        return
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        pass
-
-
-def managed_build_block(newline: bytes) -> bytes:
+def _managed_build_block(newline: bytes, apply_rel: str = BUILD_APPLY_REL) -> bytes:
     return (
         newline
         + BUILD_MARKER_START.encode("utf-8")
         + newline
-        + f"apply from: '{BUILD_APPLY_REL}'".encode("utf-8")
+        + f"apply from: '{apply_rel}'".encode("utf-8")
         + newline
         + BUILD_MARKER_END.encode("utf-8")
         + newline
     )
 
 
-def patch_build_gradle(build_gradle: Path) -> None:
+def _strip_stale_managed_build_block(build_gradle: Path) -> None:
+    data = build_gradle.read_bytes()
+    start_b = BUILD_MARKER_START.encode("utf-8")
+    end_b = BUILD_MARKER_END.encode("utf-8")
+    if start_b not in data and end_b not in data:
+        return
+
+    nl = detect_newline(data)
+    for apply_rel in BUILD_APPLY_RELS:
+        block = _managed_build_block(nl, apply_rel=apply_rel)
+        if block in data:
+            build_gradle.write_bytes(data.replace(block, b"", 1))
+            print(f"cleaned stale managed agentation hook from {build_gradle}")
+            return
+
+    for apply_rel in BUILD_APPLY_RELS:
+        apply_b = f"apply from: '{apply_rel}'".encode("utf-8")
+        pattern = re.compile(
+            rb"(?:\r?\n)?"
+            + re.escape(start_b)
+            + rb"\r?\n"
+            + re.escape(apply_b)
+            + rb"\r?\n"
+            + re.escape(end_b)
+            + rb"(?:\r?\n)?",
+            re.M,
+        )
+        patched, count = pattern.subn(b"", data, count=1)
+        if count:
+            build_gradle.write_bytes(patched)
+            print(f"cleaned stale managed agentation hook from {build_gradle} (regex fallback)")
+            return
+
+    raise SystemExit(
+        f"managed agentation markers exist in {build_gradle}, but block shape is unexpected; fix manually"
+    )
+
+
+def _patch_build_gradle(build_gradle: Path) -> None:
     data = build_gradle.read_bytes()
     newline = detect_newline(data)
-    block = managed_build_block(newline)
+    block = _managed_build_block(newline)
 
     if BUILD_MARKER_START.encode("utf-8") in data or BUILD_MARKER_END.encode("utf-8") in data:
         if block in data:
@@ -77,6 +96,18 @@ def patch_build_gradle(build_gradle: Path) -> None:
     build_gradle.write_bytes(patched)
 
 
+def _same_file_content(path: Path, payload: bytes) -> bool:
+    return path.is_file() and path.read_bytes() == payload
+
+
+def _remove_stale_payload_file(path: Path, payload: bytes) -> bool:
+    if not _same_file_content(path, payload):
+        return False
+    path.unlink()
+    print(f"removed stale managed payload: {path}")
+    return True
+
+
 def _marker_pattern(begin: str, end: str) -> re.Pattern[bytes]:
     return re.compile(
         rb"(?:\r?\n)?[ \t]*<!-- "
@@ -88,7 +119,7 @@ def _marker_pattern(begin: str, end: str) -> re.Pattern[bytes]:
     )
 
 
-def patch_debug_html(debug_html: Path, enable: bool) -> None:
+def _patch_debug_html(debug_html: Path, enable: bool) -> None:
     if not debug_html.exists():
         if enable:
             raise SystemExit(
@@ -136,7 +167,7 @@ def patch_debug_html(debug_html: Path, enable: bool) -> None:
         print(f"debug html injection already absent: {debug_html}")
 
 
-def overlay_output_status(project_dir: Path) -> None:
+def _overlay_output_status(project_dir: Path) -> None:
     build_gradle = project_dir / "build.gradle"
     debug_html = project_dir / DEBUG_HTML_REL
     overlay_js = project_dir / OVERLAY_JS_REL
@@ -157,67 +188,82 @@ def overlay_output_status(project_dir: Path) -> None:
     print(f"overlay bundle: {'PRESENT' if overlay_js.exists() else 'MISSING'}")
 
 
-def load_agentation_gradle_block(payload_file: Path) -> str:
-    if not payload_file.is_file():
-        raise SystemExit(f"agentation payload file not found: {payload_file}")
-    data = payload_file.read_text(encoding="utf-8")
-    if "AGENTATION_GRADLE_HOOK_BEGIN" not in data:
-        raise SystemExit(f"unexpected agentation payload file (marker missing): {payload_file}")
-    return data
+def _load_agentation_gradle_payload() -> tuple[str, bytes]:
+    text = payload_text("agentation_gradle")
+    if "AGENTATION_GRADLE_HOOK_BEGIN" not in text:
+        raise SystemExit("unexpected agentation payload (marker missing)")
+    return text, text.encode("utf-8")
 
 
-def run_gradle_agentation(project_dir: Path) -> None:
-    gradlew = project_dir / "gradlew"
-    if not gradlew.exists():
-        raise SystemExit(f"gradlew not found: {gradlew}")
-    if not os.access(gradlew, os.X_OK):
-        raise SystemExit(f"gradlew not executable: {gradlew}")
-
-    cmd = [str(gradlew), "agentationOverlay"]
-    print("running:", " ".join(cmd))
-    subprocess.run(cmd, cwd=project_dir, check=True)
+def _run_agentation_overlay(project_dir: Path) -> None:
+    run_gradle_task(project_dir, "agentationOverlay")
 
 
-def action_inject(project_dir: Path, payload_file: Path) -> int:
+def inject_agentation(ctx: StageRunContext) -> int:
+    project_dir = ctx.project_dir
+    ensure_project_dir(project_dir)
+
     build_gradle = project_dir / "build.gradle"
     if not build_gradle.exists():
         raise SystemExit(f"build.gradle not found: {build_gradle}")
+
+    payload_text_value, payload_bytes_value = _load_agentation_gradle_payload()
     build_gradle_bytes = build_gradle.read_bytes()
 
     if PROJECT_AGENTATION_HOOK_MARKER.encode("utf-8") in build_gradle_bytes:
         print("project agentation hook already enabled in build.gradle; skipping temporary Gradle injection")
-        run_gradle_agentation(project_dir)
-        patch_debug_html(project_dir / DEBUG_HTML_REL, enable=True)
+        _run_agentation_overlay(project_dir)
+        _patch_debug_html(project_dir / DEBUG_HTML_REL, enable=True)
         return 0
 
-    tmp_dir = project_dir / ".codex-agentation-debug-tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
+    dzsc_dir = project_dir / ".dzsc"
+    tmp_dir = dzsc_dir / "tmp"
     temp_apply = project_dir / BUILD_APPLY_REL
-    build_backup = tmp_dir / "build.gradle.bak"
-    temp_apply_backup = tmp_dir / "codex-agentation-debug.gradle.bak"
-    shutil.copy2(build_gradle, build_backup)
+    legacy_temp_apply = project_dir / LEGACY_BUILD_APPLY_REL
+    legacy_tmp_dir = project_dir / ".codex-agentation-debug-tmp"
+
+    _strip_stale_managed_build_block(build_gradle)
+    removed_legacy_temp_apply = _remove_stale_payload_file(legacy_temp_apply, payload_bytes_value)
+    removed_temp_apply = _remove_stale_payload_file(temp_apply, payload_bytes_value)
+    if removed_legacy_temp_apply:
+        rmdir_if_empty(legacy_temp_apply.parent)
+    if removed_temp_apply:
+        rmdir_if_empty(temp_apply.parent)
+        rmdir_if_empty(dzsc_dir)
+
+    had_dzsc_dir = dzsc_dir.is_dir()
+    had_dzsc_gradle_dir = (dzsc_dir / "gradle").is_dir()
     had_temp_apply = temp_apply.exists()
+
+    build_backup = tmp_dir / "build.gradle.bak"
+    temp_apply_backup = tmp_dir / "agentation-debug-overlay.gradle.bak"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(build_gradle, build_backup)
     if had_temp_apply:
-        temp_apply_backup.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(temp_apply, temp_apply_backup)
 
     try:
-        gradle_block = load_agentation_gradle_block(payload_file)
         temp_apply.parent.mkdir(parents=True, exist_ok=True)
-        temp_apply.write_text(gradle_block, encoding="utf-8")
-        patch_build_gradle(build_gradle)
-        run_gradle_agentation(project_dir)
-        patch_debug_html(project_dir / DEBUG_HTML_REL, enable=True)
+        temp_apply.write_text(payload_text_value, encoding="utf-8")
+        _patch_build_gradle(build_gradle)
+        _run_agentation_overlay(project_dir)
+        _patch_debug_html(project_dir / DEBUG_HTML_REL, enable=True)
         return 0
     finally:
         restore_file(build_gradle, build_backup)
         restore_file(temp_apply, temp_apply_backup if had_temp_apply else None)
+        if not had_dzsc_gradle_dir:
+            rmdir_if_empty(temp_apply.parent)
         shutil.rmtree(tmp_dir, ignore_errors=True)
+        if not had_dzsc_dir:
+            rmdir_if_empty(dzsc_dir)
+        shutil.rmtree(legacy_tmp_dir, ignore_errors=True)
 
 
-def action_remove(project_dir: Path) -> int:
-    patch_debug_html(project_dir / DEBUG_HTML_REL, enable=False)
+def remove_agentation(ctx: StageRunContext) -> int:
+    project_dir = ctx.project_dir
+    ensure_project_dir(project_dir)
+    _patch_debug_html(project_dir / DEBUG_HTML_REL, enable=False)
     overlay_dir = project_dir / OVERLAY_DIR_REL
     if overlay_dir.exists():
         shutil.rmtree(overlay_dir)
@@ -227,75 +273,27 @@ def action_remove(project_dir: Path) -> int:
     return 0
 
 
-def action_status(project_dir: Path) -> int:
-    overlay_output_status(project_dir)
+def agentation_status(ctx: StageRunContext) -> int:
+    ensure_project_dir(ctx.project_dir)
+    _overlay_output_status(ctx.project_dir)
     return 0
 
 
-def main() -> int:
-    action = os.environ.get("AGENTATION_DEBUG_ACTION", "").strip() or "inject"
-    project_dir = Path(os.environ.get("AGENTATION_DEBUG_PROJECT", ".")).expanduser().resolve()
-    payload_file = Path(
-        os.environ.get("AGENTATION_DEBUG_PAYLOAD_FILE", "agentation-debug-overlay.gradle")
-    ).expanduser().resolve()
+INJECT_AGENTATION_STAGE = stage(
+    "inject_agentation",
+    "Build/inject agentation overlay into target/web/debug.html (one-shot temporary Gradle hook)",
+    aliases=("inject-agentation", "generate_agentation"),
+)(inject_agentation)
 
-    if not project_dir.is_dir():
-        print(f"project directory not found: {project_dir}", file=sys.stderr)
-        return 2
+REMOVE_AGENTATION_STAGE = stage(
+    "remove_agentation",
+    "Remove managed agentation injection from debug.html and delete overlay output dir",
+    aliases=("remove-agentation",),
+)(remove_agentation)
 
-    if action == "inject":
-        return action_inject(project_dir, payload_file)
-    if action == "remove":
-        return action_remove(project_dir)
-    if action == "status":
-        return action_status(project_dir)
+AGENTATION_STATUS_STAGE = stage(
+    "agentation_status",
+    "Show agentation overlay/debug.html injection status",
+    aliases=("agentation-status",),
+)(agentation_status)
 
-    print(f"unknown action: {action}", file=sys.stderr)
-    return 2
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-endef
-export AGENTATION_DEBUG_RUNNER_PY
-
-help:
-	@printf '%s\n' \
-		'External Agentation debug helper (one-shot, no repo diffs left behind)' \
-		'' \
-		'Targets:' \
-		'  injectDebugAgentation    Build overlay and inject into target/web/debug.html' \
-		'  generateDebugAgentation  Alias of injectDebugAgentation' \
-		'  removeDebugAgentation    Remove injection from target/web/debug.html and delete overlay output' \
-		'  agentationStatus         Show target output/injection status' \
-			'' \
-			'Variables:' \
-			'  PROJECT=<path>           Target project root (default: current working directory)' \
-			'  PAYLOAD_FILE=<path>      Agentation Gradle payload script in scripts/ (default: agentation-debug-overlay.gradle)' \
-			'  PYTHON=<path>            Python interpreter (default: python3)'
-
-injectDebugAgentation:
-	@tmp_py=$$(mktemp); \
-	printf '%s\n' "$$AGENTATION_DEBUG_RUNNER_PY" > "$$tmp_py"; \
-	AGENTATION_DEBUG_ACTION=inject AGENTATION_DEBUG_PROJECT="$(PROJECT_DIR)" AGENTATION_DEBUG_PAYLOAD_FILE="$(abspath $(PAYLOAD_FILE))" "$(PYTHON)" "$$tmp_py"; \
-	status=$$?; \
-	rm -f "$$tmp_py"; \
-	exit $$status
-
-generateDebugAgentation: injectDebugAgentation
-
-removeDebugAgentation:
-	@tmp_py=$$(mktemp); \
-	printf '%s\n' "$$AGENTATION_DEBUG_RUNNER_PY" > "$$tmp_py"; \
-	AGENTATION_DEBUG_ACTION=remove AGENTATION_DEBUG_PROJECT="$(PROJECT_DIR)" "$(PYTHON)" "$$tmp_py"; \
-	status=$$?; \
-	rm -f "$$tmp_py"; \
-	exit $$status
-
-agentationStatus:
-	@tmp_py=$$(mktemp); \
-	printf '%s\n' "$$AGENTATION_DEBUG_RUNNER_PY" > "$$tmp_py"; \
-	AGENTATION_DEBUG_ACTION=status AGENTATION_DEBUG_PROJECT="$(PROJECT_DIR)" "$(PYTHON)" "$$tmp_py"; \
-	status=$$?; \
-	rm -f "$$tmp_py"; \
-	exit $$status
