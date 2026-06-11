@@ -4,7 +4,7 @@
 
 Репозиторий:
 - Локальный путь: `/Users/idfedorov09/my_prog/work_folder/doczilla/scripts`
-- Remote: `https://git.doczilla.pro/idfedorov09/scripts.git`
+- Remote: `git@github.com:idfedorov09/dzsc.git`
 
 ## Что делает инструмент
 
