@@ -38,6 +38,23 @@ STAGE_OPTION_MAP: dict[str, dict[str, _StageOptionDef]] = {
         "--debug-path": _StageOptionDef("debug_html_path", "path"),
         "--overlay-dir": _StageOptionDef("overlay_dir_path", "path"),
     },
+    "schema_list": {
+        "--compose-file": _StageOptionDef("compose_file", "path"),
+        "--doczilla-service": _StageOptionDef("doczilla_service", "str"),
+        "--postgres-service": _StageOptionDef("postgres_service", "str"),
+    },
+    "schema_current": {
+        "--compose-file": _StageOptionDef("compose_file", "path"),
+        "--doczilla-service": _StageOptionDef("doczilla_service", "str"),
+        "--postgres-service": _StageOptionDef("postgres_service", "str"),
+    },
+    "schema_switch": {
+        "--compose-file": _StageOptionDef("compose_file", "path"),
+        "--doczilla-service": _StageOptionDef("doczilla_service", "str"),
+        "--postgres-service": _StageOptionDef("postgres_service", "str"),
+        "--schema": _StageOptionDef("schema_name", "str"),
+        "--yes": _StageOptionDef("yes", "flag"),
+    },
 }
 
 
@@ -55,6 +72,8 @@ def _normalize_option_name(raw_name: str) -> str:
 def _convert_option_value(value_kind: str, raw_value: str) -> object:
     if value_kind == "path":
         return Path(raw_value).expanduser()
+    if value_kind == "flag":
+        return raw_value.lower() not in {"0", "false", "no", "off"}
     return raw_value
 
 
@@ -112,6 +131,11 @@ def _parse_pipeline_tokens(tokens: tuple[str, ...]) -> list[StageInvocation]:
             raise click.UsageError(
                 f"Unknown option '{option_token}' for stage '{current.stage_name}'. Allowed: {allowed}"
             )
+
+        if option_def.value_kind == "flag" and raw_value is None:
+            current.overrides[option_def.ctx_field] = True
+            idx += 1
+            continue
 
         if raw_value is None:
             if idx + 1 >= len(tokens) or tokens[idx + 1] in STAGE_MARKERS:

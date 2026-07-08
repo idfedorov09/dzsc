@@ -15,6 +15,9 @@
 - `inject_agentation`: собирает/инжектит agentation overlay в debug HTML.
 - `remove_agentation`: удаляет managed-snippet из debug HTML и директорию overlay.
 - `agentation_status`: показывает текущий статус (hooks/snippet/bundle).
+- `schema_list`: показывает локальные docker-compose Postgres-схемы и Doczilla-метаданные.
+- `schema_current`: показывает текущую runtime-схему Doczilla из живой JVM.
+- `schema_switch`: переключает живую Doczilla JVM на другую Postgres-схему через временный attach hook.
 
 ## One-shot контракт
 
@@ -25,7 +28,8 @@
 
 Что остаётся как целевой результат:
 - source maps и другие build-артефакты Gradle;
-- overlay bundle и инжект в HTML после `inject_agentation`.
+- overlay bundle и инжект в HTML после `inject_agentation`;
+- runtime-состояние JVM после `schema_switch` (временные hook-файлы удаляются).
 
 ## Установка
 
@@ -105,6 +109,44 @@ dzsc --project /path/to/pro.doczilla.clm \
 ### `agentation_status`
 - `--debug-path <file>` (по умолчанию `target/web/debug.html`)
 - `--overlay-dir <dir>` (по умолчанию `target/web/debug/agentation`)
+
+### `schema_list`
+- `--compose-file <file>` (по умолчанию ищется от `--project` вверх)
+- `--doczilla-service <name>` (по умолчанию `doczilla`)
+- `--postgres-service <name>` (по умолчанию `postgres`)
+
+Пример:
+
+```bash
+dzsc --project /path/to/pro.doczilla.clm -stage schema_list
+```
+
+`last activity` считается как максимум из последнего изменения данных (`CreatedAt`/`ModifiedAt`) и mtime security-log. Read-only использование из Postgres без дополнительной телеметрии не видно.
+
+### `schema_current`
+- `--compose-file <file>` (по умолчанию ищется от `--project` вверх)
+- `--doczilla-service <name>` (по умолчанию `doczilla`)
+
+Пример:
+
+```bash
+dzsc --project /path/to/pro.doczilla.clm -stage schema_current
+```
+
+### `schema_switch`
+- `--schema <name>`: целевая Doczilla-схема.
+- `--yes`: подтверждение, что можно сбросить активные сессии и соединения.
+- `--compose-file <file>` (по умолчанию ищется от `--project` вверх)
+- `--doczilla-service <name>` (по умолчанию `doczilla`)
+- `--postgres-service <name>` (по умолчанию `postgres`)
+
+Пример:
+
+```bash
+dzsc --project /path/to/pro.doczilla.clm -stage schema_switch --schema public --yes
+```
+
+`schema_switch` компилирует временный Java attach payload внутри контейнера `doczilla`, меняет `ServerConfig.databaseSchema` и system property в живой JVM, чистит сессии/websocket state/DB connections и перезапускает scheduler для новой схемы. Файлы payload создаются в `.dzsc/run/<run-id>` и `/tmp` контейнера только на время команды.
 
 ## Текущие static payload-файлы
 

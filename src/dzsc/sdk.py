@@ -12,11 +12,16 @@ StageHandler = Callable[["StageRunContext"], int | None]
 class StageRunContext:
     project_dir: Path
     python_bin: str
+    compose_file: Path | None = None
+    doczilla_service: str = "doczilla"
+    postgres_service: str = "postgres"
     sourcemap_config: Path | None = None
     concat_source_roots: tuple[str, ...] = ()
     local_project_search_roots: tuple[str, ...] = ()
     debug_html_path: Path | None = None
     overlay_dir_path: Path | None = None
+    schema_name: str | None = None
+    yes: bool = False
     verbose: bool = False
 
 

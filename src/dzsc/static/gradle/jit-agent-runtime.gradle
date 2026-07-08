@@ -1,0 +1,114 @@
+/* DZSC_JIT_AGENT_RUNTIME_GRADLE_HOOK_BEGIN */
+
+ext.dzscAgentRuntimeConfig = [
+	staticDir       : file('__DZSC_AGENT_RUNTIME_STATIC_DIR__'),
+	generatedDir    : file("${buildDir}/dzsc-agent-runtime/generated"),
+	javaDir         : file("${buildDir}/dzsc-agent-runtime/generated/java"),
+	resourcesDir    : file("${buildDir}/dzsc-agent-runtime/generated/resources"),
+	dependenciesDir : file("${buildDir}/web/WEB-INF/dzsc-agent/dependencies"),
+	runnerDir       : file("${buildDir}/bin"),
+	installAppDir   : file("${buildDir}/install/${project.name}")
+]
+
+if(!dzscAgentRuntimeConfig.staticDir.exists())
+	throw new GradleException("dzsc agent runtime static payload not found: ${dzscAgentRuntimeConfig.staticDir}")
+
+sourceSets {
+	main {
+		java.srcDir dzscAgentRuntimeConfig.javaDir
+		resources.srcDir dzscAgentRuntimeConfig.resourcesDir
+	}
+}
+
+dependencies {
+	compile "org.zenframework.z8:org.zenframework.z8.compiler"
+}
+
+def dzscAgentRuntimeModules = [
+	'pro.doczilla.base.core',
+	'pro.doczilla.base.workflow',
+	'pro.doczilla.dict.dadata',
+	'pro.doczilla.cloud.core',
+	'pro.doczilla.cloud.gpt',
+	'pro.doczilla.clm.core'
+]
+
+task dzscAgentRuntimeGenerateSources(type: Copy) {
+	group = 'Build'
+	description = 'Generates dzsc JIT agent runtime Java bridge sources'
+	from new File(dzscAgentRuntimeConfig.staticDir, 'java')
+	into dzscAgentRuntimeConfig.javaDir
+}
+
+task dzscAgentRuntimeGenerateResources(type: Copy) {
+	group = 'Build'
+	description = 'Generates dzsc JIT agent runtime descriptors'
+	from new File(dzscAgentRuntimeConfig.staticDir, 'resources')
+	into dzscAgentRuntimeConfig.resourcesDir
+}
+
+compileJava.dependsOn dzscAgentRuntimeGenerateSources
+processResources.dependsOn dzscAgentRuntimeGenerateResources
+
+task dzscAgentRuntimeCopyDependencies(type: Copy) {
+	group = 'Build'
+	description = 'Copies isolated BL dependencies for dzsc JIT agent runtime'
+
+	into dzscAgentRuntimeConfig.dependenciesDir
+	duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+
+	def langTask = tasks.findByPath(':org.zenframework.z8:org.zenframework.z8.lang:assembleBlartifact')
+	if(langTask != null)
+		dependsOn langTask
+
+	dzscAgentRuntimeModules.each { String moduleName ->
+		def moduleTask = tasks.findByPath(":${moduleName}:assembleBlartifact")
+		if(moduleTask != null)
+			dependsOn moduleTask
+	}
+
+	from("${rootProject.projectDir}/org.zenframework.z8/org.zenframework.z8.lang/target/libs") {
+		include 'org.zenframework.z8.lang-*.zip'
+	}
+
+	dzscAgentRuntimeModules.each { String moduleName ->
+		from("${rootProject.projectDir}/${moduleName}/target/libs") {
+			include "${moduleName}-*.blar"
+		}
+	}
+}
+
+task dzscAgentRuntimeInstallRunner(type: Copy) {
+	group = 'Build'
+	description = 'Installs dzsc agent runtime runner script into target/bin'
+	from new File(dzscAgentRuntimeConfig.staticDir, 'bin')
+	into dzscAgentRuntimeConfig.runnerDir
+	fileMode = 0755
+}
+
+assemble.dependsOn dzscAgentRuntimeCopyDependencies, dzscAgentRuntimeInstallRunner
+
+distributions {
+	main {
+		contents {
+			from("${buildDir}/web/WEB-INF") {
+				include 'dzsc-agent/dependencies/**'
+			}
+			into('bin') {
+				from dzscAgentRuntimeConfig.runnerDir
+				include 'dzsc-agent-runtime-run'
+				fileMode = 0755
+			}
+		}
+	}
+}
+
+installDist.dependsOn dzscAgentRuntimeCopyDependencies, dzscAgentRuntimeInstallRunner
+
+task dzscAgentRuntimeInstall {
+	group = 'Build'
+	description = 'Builds installDist with dzsc JIT agent runtime bridge and runner'
+	dependsOn installDist
+}
+
+/* DZSC_JIT_AGENT_RUNTIME_GRADLE_HOOK_END */

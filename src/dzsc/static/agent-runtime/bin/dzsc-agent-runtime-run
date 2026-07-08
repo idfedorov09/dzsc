@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.cookies import SimpleCookie
+
+
+BRIDGE_REQUEST = "pro.doczilla.dzsc.agent.DzscAgentBridge"
+DEFAULT_CLASS_NAME = "pro.doczilla.dzsc.agent.AgentTask"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="dzsc-agent-runtime-run",
+        description="Run BL code inside a running Doczilla through the DZSC JIT agent bridge.",
+    )
+    parser.add_argument("--url", default=os.environ.get("DOCZILLA_URL", "http://127.0.0.1:9080/request.json"))
+    parser.add_argument("--session", default=os.environ.get("DOCZILLA_SESSION"))
+    parser.add_argument("--login", default=os.environ.get("DOCZILLA_LOGIN", "Admin"))
+    parser.add_argument("--password", default=os.environ.get("DOCZILLA_PASSWORD", "12345678"))
+    parser.add_argument("--schema", default=os.environ.get("DOCZILLA_SCHEMA"))
+    parser.add_argument("--licence", default=os.environ.get("DOCZILLA_LICENCE", ""))
+    parser.add_argument("--file", "-f", help="BL source file. Reads stdin when omitted.")
+    parser.add_argument("--class-name", default=DEFAULT_CLASS_NAME)
+    parser.add_argument("--method", default="run")
+    parser.add_argument("--input", default="{}")
+    parser.add_argument("--as-current-user", action="store_true", help="Do not switch execution to system user inside the bridge.")
+    parser.add_argument("--keep-workspace", action="store_true", help="Keep generated BL/Java/classes on the server for debugging.")
+    parser.add_argument("--raw-response", action="store_true", help="Print the full Doczilla response JSON.")
+    parser.add_argument("--result-only", action="store_true", help="Print only data[0].result.")
+    return parser.parse_args()
+
+
+def read_code(path: str | None) -> str:
+    if path:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    return sys.stdin.read()
+
+
+def post(url: str, data: dict[str, str], session: str | None = None) -> tuple[dict, str | None]:
+    encoded = urllib.parse.urlencode(data).encode("utf-8")
+    request = urllib.request.Request(url, data=encoded, method="POST")
+    request.add_header("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+    if session:
+        request.add_header("Cookie", f"session={session}")
+
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            raw = response.read().decode("utf-8", errors="replace")
+            cookie_session = extract_session(response.headers.get_all("Set-Cookie") or [])
+    except urllib.error.HTTPError as error:
+        raw = error.read().decode("utf-8", errors="replace")
+        raise SystemExit(f"HTTP {error.code}: {raw}") from error
+    except urllib.error.URLError as error:
+        raise SystemExit(f"Request failed: {error}") from error
+
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise SystemExit(f"Non-JSON response: {raw}") from error
+    return parsed, cookie_session
+
+
+def extract_session(headers: list[str]) -> str | None:
+    for header in headers:
+        cookie = SimpleCookie()
+        cookie.load(header)
+        if "session" in cookie:
+            return cookie["session"].value
+    return None
+
+
+def sign_in(args: argparse.Namespace) -> str:
+    data = {
+        "request": "signin",
+        "login": args.login,
+        "password": client_password(args.password),
+    }
+    if args.schema:
+        data["schema"] = args.schema
+    response, session = post(args.url, data)
+    if not session:
+        session = find_session(response)
+    if not session:
+        raise SystemExit("Sign-in succeeded but no session cookie/id was returned")
+    return session
+
+
+def client_password(password: str) -> str:
+    if re.fullmatch(r"[0-9a-fA-F]{32}", password or ""):
+        return password.lower()
+    return hashlib.md5((password or "").encode("utf-8")).hexdigest()
+
+
+def find_session(value) -> str | None:
+    if isinstance(value, dict):
+        for key in ("session", "id"):
+            item = value.get(key)
+            if isinstance(item, str) and item:
+                return item
+        for item in value.values():
+            found = find_session(item)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for item in value:
+            found = find_session(item)
+            if found:
+                return found
+    return None
+
+
+def run_bridge(args: argparse.Namespace, session: str, code: str) -> dict:
+    data = {
+        "request": BRIDGE_REQUEST,
+        "session": session,
+        "licence": args.licence,
+        "code": code,
+        "className": args.class_name,
+        "methodName": args.method,
+        "input": args.input,
+        "asCurrentUser": "true" if args.as_current_user else "false",
+        "keepWorkspace": "true" if args.keep_workspace else "false",
+    }
+    if args.schema:
+        data["schema"] = args.schema
+    response, _ = post(args.url, data, session=session)
+    return response
+
+
+def print_result(response: dict, args: argparse.Namespace) -> int:
+    data = response.get("data") or []
+    item = data[0] if isinstance(data, list) and data else response
+    ok = bool(item.get("ok")) if isinstance(item, dict) else False
+
+    if args.raw_response:
+        print(json.dumps(response, ensure_ascii=False, indent=2))
+        return 0 if response.get("success", True) and ok else 1
+
+    if args.result_only and ok:
+        result = item.get("result")
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+            except json.JSONDecodeError:
+                print(result)
+            else:
+                print(json.dumps(parsed, ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    print(json.dumps(item, ensure_ascii=False, indent=2))
+    return 0 if ok else 1
+
+
+def main() -> int:
+    args = parse_args()
+    code = read_code(args.file)
+    if not code.strip():
+        raise SystemExit("BL source is empty")
+
+    session = args.session or sign_in(args)
+    response = run_bridge(args, session, code)
+    return print_result(response, args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

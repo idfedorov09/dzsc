@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -61,12 +62,16 @@ def resolve_gradle_wrapper(project_dir: Path) -> list[str]:
     return [str(gradlew)]
 
 
+def gradle_command(project_dir: Path, *args: str) -> list[str]:
+    extra_args = shlex.split(os.environ.get("DZSC_GRADLE_ARGS", ""))
+    return [*resolve_gradle_wrapper(project_dir), *extra_args, *args]
+
+
 def run_gradle_task(project_dir: Path, task: str, *, env: dict[str, str] | None = None) -> None:
-    cmd = [*resolve_gradle_wrapper(project_dir), task]
+    cmd = gradle_command(project_dir, task)
     print("running:", " ".join(cmd))
     subprocess.run(cmd, cwd=project_dir, env=env, check=True)
 
 
 def default_python_bin() -> str:
     return sys.executable or "python3"
-

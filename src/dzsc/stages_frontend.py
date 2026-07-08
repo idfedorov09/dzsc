@@ -7,7 +7,7 @@ import subprocess
 import uuid
 from pathlib import Path
 
-from dzsc.common import detect_newline, ensure_project_dir, resolve_gradle_wrapper, rmdir_if_empty
+from dzsc.common import detect_newline, ensure_project_dir, gradle_command, rmdir_if_empty
 from dzsc.payloads import payload_bytes, payload_text
 from dzsc.sdk import StageRunContext, stage
 
@@ -113,7 +113,6 @@ def run_dz_source_maps(ctx: StageRunContext) -> int:
     if not build_gradle.is_file():
         raise SystemExit(f"build.gradle not found: {build_gradle}")
 
-    gradle_cmd_base = resolve_gradle_wrapper(project_dir)
     gradle_payload = payload_bytes("sourcemap_gradle")
     config_text = (
         ctx.sourcemap_config.read_text(encoding="utf-8")
@@ -148,7 +147,7 @@ def run_dz_source_maps(ctx: StageRunContext) -> int:
         gradle_env = os.environ.copy()
         gradle_env["Z8_SM_CONCAT_SOURCE_ROOTS"] = ",".join(concat_roots)
         gradle_env["Z8_SM_LOCAL_PROJECT_SEARCH_ROOTS"] = ",".join(local_roots)
-        subprocess.run([*gradle_cmd_base, "generateDebugJsSourceMap"], cwd=project_dir, env=gradle_env, check=True)
+        subprocess.run(gradle_command(project_dir, "generateDebugJsSourceMap"), cwd=project_dir, env=gradle_env, check=True)
         return 0
     finally:
         build_gradle.write_bytes(baseline_build)
